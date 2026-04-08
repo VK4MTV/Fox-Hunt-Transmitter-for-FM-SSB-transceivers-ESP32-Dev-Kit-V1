@@ -10,11 +10,10 @@
 // --- CONFIGURATION ---
 const char* ssid = "FOX_HUNT_AM_TRANSMITTER";
 const char* password = "foxhunt123";
-#define PWM_PIN 18      
+#define DAC_PIN 25      // GPIO25 = DAC1 on ESP32
+#define PTT_PIN 27      // PTT enable: HIGH during TX, LOW when idle
 #define PLAY_PIN 14     
-#define STOP_PIN 13     
-#define PWM_FREQ 80000  
-#define PWM_RES 8
+#define STOP_PIN 13
 #define BUFFER_SIZE 512
 uint8_t audioBuffer[BUFFER_SIZE];
 int bufferPointer = 0;
@@ -25,7 +24,6 @@ AsyncWebServer server(80);
 std::vector<String> playlist;
 int currentIndex = 0;
 bool isRunning = false;
-int last_pwm_out = 128;
 float gain_booster = 1.2; 
 int last_sample = 128; 
 TaskHandle_t AudioTaskHandle;
@@ -45,6 +43,21 @@ const int step_table[] = {
   1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 
   3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 
   12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767 
+};
+
+// morse_table layout: indices 0-9 = digits '0'-'9',
+//                     indices 10-16 = (unused/special chars),
+//                     indices 17-42 = letters 'A'-'Z'
+#define MORSE_LETTER_OFFSET 17
+// 1000 Hz sine-wave: 32 samples/cycle, one sample every 31.25 µs → ~1000 Hz
+#define SINE_SAMPLE_US      31
+// Pre-computed dot/dash sample counts (avoids division inside time-critical loop)
+#define DOT_SAMPLES  ((200 * 1000) / SINE_SAMPLE_US)   // ~6451
+#define DASH_SAMPLES ((600 * 1000) / SINE_SAMPLE_US)   // ~19354
+const uint8_t sine_table[32] = {
+  128, 148, 166, 184, 199, 211, 220, 226, 228, 226, 220, 211,
+  199, 184, 166, 148, 128, 108,  90,  72,  57,  45,  36,  30,
+   28,  30,  36,  45,  57,  72,  90, 108
 };
 
 int predictor = 0;
@@ -86,7 +99,7 @@ void apply_ramp(int target, int ms) {
   int total_diff = target - current;
   for (int i = 1; i <= steps; i++) {
     int next_val = current + (total_diff * i / steps);
-    ledcWrite(PWM_PIN, next_val);
+    dacWrite(DAC_PIN, (uint8_t)constrain(next_val, 0, 255));
     // Use delayMicroseconds for sub-millisecond ramps to avoid 8Hz pulse
     delayMicroseconds((ms * 1000) / steps);
   }
@@ -110,7 +123,7 @@ void decodeAndOutput(uint8_t n) {
   for (int i = 1; i <= 4; i++) {
     int intermediate = start_sample + ((total_change * i) >> 2);
     int final_out = (int)(intermediate * gain_booster);
-    ledcWrite(PWM_PIN, (uint32_t)constrain(final_out, 0, 255));
+    dacWrite(DAC_PIN, (uint8_t)constrain(final_out, 0, 255));
     delayMicroseconds(42); 
   }
   last_sample = target_sample;
@@ -118,24 +131,48 @@ void decodeAndOutput(uint8_t n) {
 
 void sendMorse(String text) {
   text.toUpperCase();
-  const int rampTime = 15; // 15ms rounded edge to prevent splatter
-  
-  for (int i = 0; i < text.length(); i++) {
-    char c = text[i];
-    // ... index lookup logic ...
-    
-    const char* pattern = morse_table[index];
-    for (int j = 0; j < strlen(pattern); j++) {
-      int duration = (pattern[j] == '.') ? 200 : 600;
+  digitalWrite(PTT_PIN, HIGH);
 
-      apply_ramp(255, rampTime);                // Round UP
-      vTaskDelay(pdMS_TO_TICKS(duration));     // Hold ON
-      apply_ramp(0, rampTime);                  // Round DOWN
-      
-      vTaskDelay(pdMS_TO_TICKS(200));           // Inter-element gap
+  for (int i = 0; i < (int)text.length(); i++) {
+    char c = text[i];
+    int index;
+
+    if (c == ' ') {
+      // Word gap – extra silence (inter-char gap already follows last letter)
+      dacWrite(DAC_PIN, 128);
+      vTaskDelay(pdMS_TO_TICKS(600));
+      continue;
+    } else if (c >= '0' && c <= '9') {
+      index = c - '0';
+    } else if (c >= 'A' && c <= 'Z') {
+      index = c - 'A' + MORSE_LETTER_OFFSET;
+    } else {
+      continue; // skip unsupported characters
     }
-    vTaskDelay(pdMS_TO_TICKS(400));             // Inter-character gap
+
+    const char* pattern = morse_table[index];
+    for (int j = 0; j < (int)strlen(pattern); j++) {
+
+      // Generate 1000 Hz sine-wave tone for dot/dash duration
+      // 32 samples/cycle × SINE_SAMPLE_US µs/sample ≈ 1000 Hz
+      int total_samples = (pattern[j] == '.') ? DOT_SAMPLES : DASH_SAMPLES;
+      for (int s = 0; s < total_samples; s++) {
+        dacWrite(DAC_PIN, sine_table[s % 32]);
+        delayMicroseconds(SINE_SAMPLE_US);
+      }
+
+      // Inter-element silence
+      dacWrite(DAC_PIN, 128);
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // Inter-character gap (additional silence after last element gap)
+    dacWrite(DAC_PIN, 128);
+    vTaskDelay(pdMS_TO_TICKS(400));
   }
+
+  dacWrite(DAC_PIN, 128);
+  digitalWrite(PTT_PIN, LOW);
 }
 
 void playNextItem() {
@@ -143,14 +180,15 @@ void playNextItem() {
   String item = playlist[currentIndex];
 
   if (item.startsWith("M:")) {
-    sendMorse(item.substring(2));
+    sendMorse(item.substring(2));   // sendMorse handles PTT internally
   } else if (item.toInt() > 0) {
-    apply_ramp(0, 15);
+    dacWrite(DAC_PIN, 128);         // Silence – no PTT
     // Use delay() which is an alias for vTaskDelay to let Core 0 work
     delay(item.toInt() * 1000);
   } else {
     File f = LittleFS.open("/" + item, "r");
     if (f) {
+      digitalWrite(PTT_PIN, HIGH);  // Assert PTT before audio
       apply_ramp(128, 15);
       f.seek(44);
       predictor = 0;
@@ -177,7 +215,8 @@ void playNextItem() {
         }
       }
       f.close();
-      apply_ramp(0, 15);
+      dacWrite(DAC_PIN, 128);        // Return to silence before releasing PTT
+      digitalWrite(PTT_PIN, LOW);   // Release PTT after audio
     }
   }
   currentIndex = (currentIndex + 1) % playlist.size();
@@ -258,7 +297,9 @@ void setup() {
   
   WiFi.softAP(ssid, password);
   //sleep(false);
-  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+  pinMode(PTT_PIN, OUTPUT);
+  digitalWrite(PTT_PIN, LOW);
+  dacWrite(DAC_PIN, 128);  // Idle level = midpoint (silence)
   
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r){ r->send(200, "text/html", index_html); });
@@ -297,6 +338,6 @@ void setup() {
 
 void loop() {
   if (digitalRead(PLAY_PIN) == LOW) isRunning = true;
-  if (digitalRead(STOP_PIN) == LOW) { isRunning = false; apply_ramp(0, 10); }
+  if (digitalRead(STOP_PIN) == LOW) { isRunning = false; dacWrite(DAC_PIN, 128); digitalWrite(PTT_PIN, LOW); }
   vTaskDelay(10 / portTICK_PERIOD_MS); 
 }
