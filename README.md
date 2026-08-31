@@ -23,4 +23,6 @@ PROGRESS REPORT
 its up to you if you want to try it out,
 otherwise wait for my next update here when I test and write my review.
 
+31/08/2026 UPDATE: Now it works, its under test.
+
 cheers and have fun with it, let me know if you do, that will be appreciated.
